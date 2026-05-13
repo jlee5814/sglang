@@ -110,6 +110,14 @@ class MlxModelRunner:
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
 
+        # Research scaffold: one-shot Metal capture of the first decode step.
+        # Enabled with SGLANG_MLX_PROFILE_DECODE=1; process must also be
+        # launched with METAL_CAPTURE_ENABLED=1 or capture will raise.
+        self._mlx_profile_decode = (
+            os.environ.get("SGLANG_MLX_PROFILE_DECODE") == "1"
+        )
+        self._mlx_capture_done: bool = False
+
         self._load_model()
 
         # Pin MLX allocations to prevent OS paging
@@ -551,6 +559,7 @@ class MlxModelRunner:
             model_output = self.model(input_ids, cache=cache)
             logits = self._extract_logits(model_output)
             lazy_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+            lazy_tokens = self._maybe_capture_decode(lazy_tokens)
             return MlxPendingDecode(
                 lazy_tokens=lazy_tokens,
                 req_ids=list(req_ids),
@@ -579,11 +588,47 @@ class MlxModelRunner:
         finally:
             clear_context()
 
+        lazy_tokens = self._maybe_capture_decode(lazy_tokens)
         return MlxPendingDecode(
             lazy_tokens=lazy_tokens,
             req_ids=list(req_ids),
             caches=caches,
         )
+
+    def _maybe_capture_decode(self, lazy_tokens: mx.array) -> mx.array:
+        """One-shot Metal capture of the first decode step's GPU submission.
+
+        Local research scaffold for #22283. Forces a synchronous ``mx.eval``
+        inside the capture window so the lazy graph commits while capture
+        is active (otherwise downstream ``mx.async_eval`` in tp_worker
+        commits before the wrapper opens and the trace records nothing).
+        Returns the same array, already realised when capture fires.
+
+        Activated by SGLANG_MLX_PROFILE_DECODE=1; process must also be
+        launched with METAL_CAPTURE_ENABLED=1 or Metal will refuse capture.
+        """
+        if not self._mlx_profile_decode or self._mlx_capture_done:
+            return lazy_tokens
+        self._mlx_capture_done = True
+        capture_path = f"/tmp/mlx-decode-step0-{os.getpid()}.gputrace"
+        try:
+            mx.metal.start_capture(capture_path)
+        except Exception as e:
+            logger.warning(
+                f"MLX Metal capture failed to start ({e}). "
+                "Set METAL_CAPTURE_ENABLED=1 before launching Python."
+            )
+            return lazy_tokens
+        logger.info(f"MLX Metal capture started: {capture_path}")
+        try:
+            mx.eval(lazy_tokens)
+        finally:
+            try:
+                mx.metal.stop_capture()
+                logger.info(f"MLX Metal capture written: {capture_path}")
+            except Exception as e:
+                logger.warning(f"MLX Metal capture failed to stop: {e}")
+        return lazy_tokens
 
     def decode_batch_start_chained(
         self,
