@@ -129,6 +129,12 @@ class MlxModelRunner:
 
         patch_model_attention(self.model)
 
+        if os.environ.get("SGLANG_MLX_BUCKET_TIMING") == "1":
+            from sglang.srt.hardware_backend.mlx.instrument.bucket_timing import (
+                patch_bucket_timing,
+            )
+            patch_bucket_timing(self.model)
+
         self._num_layers = get_num_layers(self.model)
         self._max_seq_len = 4096  # doubles on overflow
 
