@@ -104,27 +104,50 @@ def _build_timed_moe_class(base_cls: type) -> type:
 
     class TimedMoEBlock(base_cls):
         def __call__(self, x: mx.array) -> mx.array:
+            # Routing: 5 sub-buckets, plus umbrella for cross-stage validation.
             t0 = time.perf_counter()
             gates = self.gate(x)
+            mx.eval(gates)
+            t1 = time.perf_counter()
+            _buckets["routing_gate"].append(t1 - t0)
+
             gates = mx.softmax(gates, axis=-1, precise=True)
+            mx.eval(gates)
+            t2 = time.perf_counter()
+            _buckets["routing_softmax"].append(t2 - t1)
+
             k = self.top_k
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            mx.eval(inds)
+            t3 = time.perf_counter()
+            _buckets["routing_argpartition"].append(t3 - t2)
+
             scores = mx.take_along_axis(gates, inds, axis=-1)
+            mx.eval(scores)
+            t4 = time.perf_counter()
+            _buckets["routing_take"].append(t4 - t3)
+
             if self.norm_topk_prob:
                 scores = scores / mx.sum(scores, axis=-1, keepdims=True)
-            mx.eval(inds, scores)
-            t1 = time.perf_counter()
-            _buckets["moe_routing"].append(t1 - t0)
+                mx.eval(scores)
+                t5 = time.perf_counter()
+                _buckets["routing_normalize"].append(t5 - t4)
+            else:
+                t5 = t4
+
+            # Umbrella bucket: equals sub-sum by construction (telescoping).
+            # Cross-stage validator against Stage 2's moe_routing measurement.
+            _buckets["moe_routing"].append(t5 - t0)
 
             y = self.switch_mlp(x, inds)
             mx.eval(y)
-            t2 = time.perf_counter()
-            _buckets["switch_mlp"].append(t2 - t1)
+            t6 = time.perf_counter()
+            _buckets["switch_mlp"].append(t6 - t5)
 
             y = (y * scores[..., None]).sum(axis=-2)
             mx.eval(y)
-            t3 = time.perf_counter()
-            _buckets["moe_combine"].append(t3 - t2)
+            t7 = time.perf_counter()
+            _buckets["moe_combine"].append(t7 - t6)
 
             return y
 
