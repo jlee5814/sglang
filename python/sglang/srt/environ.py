@@ -999,6 +999,12 @@ class Envs:
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
     # MLX buffer-cache cap in GB.
     SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
+    # Initial token capacity of each request's contiguous attention KV
+    # buffer, per layer. Buffers double on overflow, so this is only the floor.
+    SGLANG_MLX_REQ_KV_INIT_TOKENS = EnvInt(256)
+    # Idle request KV buffers kept for reuse; extras are dropped so MLX
+    # can recycle their memory. 0 disables reuse.
+    SGLANG_MLX_REQ_KV_POOL_SIZE = EnvInt(8)
 
     # ===================================================================
     # Ascend NPU

@@ -161,6 +161,7 @@ class MlxModelRunner:
     _enable_sampling = False
     _sanitize_nan = False
     _deterministic_seeding = False
+    _cache_pool_size = 8
 
     def __init__(
         self,
@@ -255,7 +256,17 @@ class MlxModelRunner:
             self._model_embed, self._model_norm, self._model_lm_head = (
                 self._extract_model_components()
             )
-        self._max_seq_len = 4096  # doubles on overflow
+        # Initial capacity of each request's contiguous KV buffer. Buffers
+        # double on overflow, so a small floor costs one copy per doubling
+        # instead of reserving thousands of tokens per layer per request.
+        self._max_seq_len = envs.SGLANG_MLX_REQ_KV_INIT_TOKENS.get()
+        if self._max_seq_len <= 0:
+            raise ValueError(
+                f"SGLANG_MLX_REQ_KV_INIT_TOKENS must be > 0, got {self._max_seq_len}"
+            )
+        # Bound on idle cache lists kept for reuse. Unbounded, the pool
+        # holds every buffer ever needed at peak concurrency, forever.
+        self._cache_pool_size = max(envs.SGLANG_MLX_REQ_KV_POOL_SIZE.get(), 0)
 
         self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
@@ -313,8 +324,15 @@ class MlxModelRunner:
         return self._new_native_cache()
 
     def _release_cache(self, cache: list[Any]) -> None:
-        """Return a cache list to the pool for reuse."""
-        if not self._cache_layout.has_auxiliary_state:
+        """Return a cache list to the pool for reuse, up to the pool bound.
+
+        A list past the bound is dropped; once nothing references its
+        buffers, MLX recycles them.
+        """
+        if (
+            not self._cache_layout.has_auxiliary_state
+            and len(self._cache_pool) < self._cache_pool_size
+        ):
             self._cache_pool.append(cache)
 
     def _first_attention_cache(self, cache: list[Any]) -> Any:
