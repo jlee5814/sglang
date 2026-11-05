@@ -477,25 +477,117 @@ def _lower_sdpa(mx, args, kwargs):
     if dropout not in (None, 0, 0.0):
         raise UnsupportedMlxFxGraphError("SDPA dropout is unsupported")
     if enable_gqa:
-        if any(tensor.ndim < 3 for tensor in (query, key, value)):
-            raise UnsupportedMlxFxGraphError("SDPA GQA requires a head dimension")
+        _check_sdpa_gqa_heads(query, key, value)
+    scale = float(scale) if scale is not None else 1.0 / sqrt(query.shape[-1])
+    if _sdpa_fast_path_applies(mx, query, key, value, attention_mask, enable_gqa):
+        return _fast_sdpa(mx, query, key, value, attention_mask, causal, scale)
+    return _materialized_sdpa(
+        mx, query, key, value, attention_mask, causal, scale, enable_gqa
+    )
+
+
+def _check_sdpa_gqa_heads(query, key, value) -> None:
+    if any(tensor.ndim < 3 for tensor in (query, key, value)):
+        raise UnsupportedMlxFxGraphError("SDPA GQA requires a head dimension")
+    query_heads, key_heads, value_heads = (
+        tensor.shape[-3] for tensor in (query, key, value)
+    )
+    if (
+        key_heads == 0
+        or value_heads == 0
+        or query_heads % key_heads
+        or query_heads % value_heads
+    ):
+        raise UnsupportedMlxFxGraphError(
+            "SDPA GQA key/value head counts must divide query heads"
+        )
+
+
+def _sdpa_fast_path_applies(mx, query, key, value, attention_mask, enable_gqa):
+    # mx.fast SDPA takes rank 4 inputs of one dtype, one batch shape and one
+    # head width; a float mask must already be in the input dtype.
+    if query.ndim not in (3, 4) or not query.ndim == key.ndim == value.ndim:
+        return False
+    if not query.dtype == key.dtype == value.dtype:
+        return False
+    if not query.shape[:-3] == key.shape[:-3] == value.shape[:-3]:
+        return False
+    if not query.shape[-1] == key.shape[-1] == value.shape[-1]:
+        return False
+    if attention_mask is not None and (
+        attention_mask.ndim > query.ndim
+        or attention_mask.dtype not in (mx.bool_, query.dtype)
+    ):
+        return False
+    # Without enable_gqa, unequal heads keep the materialized path's behaviour.
+    return enable_gqa or query.shape[-3] == key.shape[-3] == value.shape[-3]
+
+
+def _fast_sdpa(mx, query, key, value, attention_mask, causal, scale):
+    batched = query.ndim == 4
+    if not batched:
+        query, key, value = (mx.expand_dims(t, 0) for t in (query, key, value))
+    key, value = _match_kv_heads(mx, key, value)
+    mask = _fast_sdpa_mask(
+        mx, attention_mask, causal, rows=query.shape[-2], columns=key.shape[-2]
+    )
+    output = mx.fast.scaled_dot_product_attention(
+        query, key, value, scale=scale, mask=mask
+    )
+    if attention_mask is not None:
+        # The kernel leaves fully masked rows undefined; Torch returns zero.
+        output = mx.where(_fully_masked_rows(mx, mask), 0, output)
+    return output if batched else output[0]
+
+
+def _match_kv_heads(mx, key, value):
+    # The kernel groups query heads natively but needs equal key/value heads;
+    # repeating both to their lcm keeps head h on key h // (Hq // Hk).
+    key_heads, value_heads = key.shape[-3], value.shape[-3]
+    if key_heads == value_heads:
+        return key, value
+    heads = key_heads * value_heads // math.gcd(key_heads, value_heads)
+    return (
+        mx.repeat(key, heads // key_heads, axis=-3),
+        mx.repeat(value, heads // value_heads, axis=-3),
+    )
+
+
+def _fast_sdpa_mask(mx, attention_mask, causal, *, rows, columns):
+    if not causal:
+        return attention_mask
+    # The kernel's "causal" is lower right; it equals ATen's upper left
+    # only when L == S, so other shapes get one explicit (L, S) mask.
+    if attention_mask is None and rows == columns:
+        return "causal"
+    causal_mask = mx.tril(mx.ones((rows, columns), dtype=mx.bool_))
+    if attention_mask is None:
+        return causal_mask
+    if attention_mask.dtype == mx.bool_:
+        return mx.logical_and(attention_mask, causal_mask)
+    return mx.where(
+        causal_mask, attention_mask, mx.array(-float("inf"), attention_mask.dtype)
+    )
+
+
+def _fully_masked_rows(mx, mask):
+    if mask.dtype == mx.bool_:
+        return mx.logical_not(mx.any(mask, axis=-1, keepdims=True))
+    return mx.all(mask == -float("inf"), axis=-1, keepdims=True)
+
+
+def _materialized_sdpa(
+    mx, query, key, value, attention_mask, causal, scale, enable_gqa
+):
+    # Fallback for calls the fused kernel cannot express; builds the scores.
+    if enable_gqa:
         query_heads, key_heads, value_heads = (
             tensor.shape[-3] for tensor in (query, key, value)
         )
-        if (
-            key_heads == 0
-            or value_heads == 0
-            or query_heads % key_heads
-            or query_heads % value_heads
-        ):
-            raise UnsupportedMlxFxGraphError(
-                "SDPA GQA key/value head counts must divide query heads"
-            )
         if query_heads != key_heads:
             key = mx.repeat(key, query_heads // key_heads, axis=-3)
         if query_heads != value_heads:
             value = mx.repeat(value, query_heads // value_heads, axis=-3)
-    scale = float(scale) if scale is not None else 1.0 / sqrt(query.shape[-1])
     scores = (query @ mx.swapaxes(key, -1, -2)) * scale
     if causal:
         rows, columns = scores.shape[-2:]
