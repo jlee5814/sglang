@@ -2682,6 +2682,19 @@ class CommonKVSender(BaseKVSender):
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
+        # A client abort can land after the worker wrote Success but before the
+        # scheduler polled. poll() reports Transferring while a staging chunk is
+        # outstanding, and under deferred allocation until worker cleanup drops
+        # the room, so Success means the transfer has drained. Leave it: the
+        # next poll releases the request and clear() publishes Success. Only
+        # consult poll() once the room is already Success, so this check cannot
+        # take poll()'s bootstrap-timeout path. A Success written after the
+        # check still loses to Failed.
+        if (
+            self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Success
+            and self.poll() == KVPoll.Success
+        ):
+            return
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
